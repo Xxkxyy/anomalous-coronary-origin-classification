@@ -22,10 +22,33 @@ def collect_patients(nifti_norm_dir: str) -> list[tuple[str, int]]:
         folder = os.path.join(nifti_norm_dir, label_str)
         if not os.path.isdir(folder):
             continue
-        for fn in os.listdir(folder):
+        # 排序保证收集顺序确定性（os.listdir 顺序不保证）
+        for fn in sorted(os.listdir(folder)):
             if fn.endswith('.nii.gz'):
                 patients.append((fn.replace('.nii.gz', ''), int(label_str)))
     return patients
+
+
+def assert_no_leak(splits: dict[str, set[str]]) -> None:
+    """断言 train/val/test 三份病人 ID 集合两两无交集（数据泄漏检查）。
+
+    splits: 形如 {'train': set, 'val': set, 'test': set}，值为患者 ID 集合。
+    任何两两交集非空即抛出 AssertionError，并打印交集详情。
+    """
+    names = ['train', 'val', 'test']
+    for name in names:
+        if name not in splits:
+            raise ValueError(f'assert_no_leak 需要提供 {name} 集合')
+    for i, n1 in enumerate(names):
+        for n2 in names[i + 1:]:
+            overlap = splits[n1] & splits[n2]
+            if overlap:
+                shown = ', '.join(sorted(overlap)[:20])
+                if len(overlap) > 20:
+                    shown += ', ...'
+                raise AssertionError(
+                    f'数据泄漏: {n1} 与 {n2} 存在 {len(overlap)} 例重叠患者: {shown}'
+                )
 
 
 def kfold_split(
@@ -132,6 +155,13 @@ def main():
     n_pos = sum(1 for _, l in patients if l == 1)
     print(f'收集到 {len(patients)} 例: 阴性 {n_neg}, 阳性 {n_pos}')
 
+    # 标签冲突检查：同一患者出现在不同标签目录时应提示（确定性收集下结果可复现）
+    label_of = {}
+    for pid, label in patients:
+        if pid in label_of and label_of[pid] != label:
+            print(f'WARNING: 患者 {pid} 出现在多个标签目录（{label_of[pid]} 与 {label}），存在标签冲突！')
+        label_of[pid] = label
+
     cv_rows, test_rows = kfold_split(patients, n_folds=5, test_ratio=0.2, seed=42)
 
     # 写 CV 划分
@@ -153,6 +183,17 @@ def main():
     # 验证无泄漏
     all_ids = [r[0] for r in cv_rows] + [r[0] for r in test_rows]
     assert len(set(all_ids)) == len(patients), '存在重复/遗漏患者！'
+
+    # 两两交集泄漏检查：每个 fold 内 train/val 互斥，且与该折无关的 holdout test 互斥
+    test_ids = {r[0] for r in test_rows}
+    for fold_id in range(5):
+        fold_name = f'fold_{fold_id}'
+        train_ids = {r[0] for r in cv_rows if r[2] == fold_name and r[3] == 'train'}
+        val_ids = {r[0] for r in cv_rows if r[2] == fold_name and r[3] == 'val'}
+        assert_no_leak({'train': train_ids, 'val': val_ids, 'test': test_ids})
+    # 汇总检查：全体 CV 患者（各折 train+val）与 holdout test 互斥
+    # 注：跨折的 train/val 重叠是 k-fold CV 的正常特性，不做交集检查
+    assert_no_leak({'train': {r[0] for r in cv_rows}, 'val': set(), 'test': test_ids})
     print('\n验证通过: 无泄漏，无遗漏')
 
 

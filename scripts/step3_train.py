@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
+import random
 import shutil
 import tempfile
 
@@ -47,6 +49,41 @@ MODEL_CONFIGS = {
     "resnet18_3d":    {"channels": 1,  "mode": "3d",   "input_size": 110},
     "vit_b_16":       {"channels": 8,  "mode": "2.5d", "input_size": 224},
 }
+
+# ============================================================
+# 随机种子（可复现性）
+# ============================================================
+def seed_everything(seed: int = 42) -> None:
+    """固定 Python/NumPy/PyTorch 随机源，保证实验可复现。
+
+    必须在任何模型创建与 DataLoader 构造之前调用。
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def write_preprocess_meta_sidecar(ckpt_dir: str) -> None:
+    """将 step1 的预处理元数据复制到 checkpoints/<model>/preprocess_meta.json
+
+    训练数据由 step1_preprocess.py 生成时会在 nifti_norm/ 写该 sidecar；
+    训练时一并归档到模型目录，保证"训练时看到的数据如何生成"可追溯。
+    若缺失则写占位元数据并警告（不影响训练主流程）。
+    """
+    os.makedirs(ckpt_dir, exist_ok=True)
+    src = os.path.join(PROJECT_ROOT, "nifti_norm", "preprocess_meta.json")
+    dst = os.path.join(ckpt_dir, "preprocess_meta.json")
+    if os.path.exists(src):
+        shutil.copy2(src, dst)
+        print(f"  预处理元数据 → {dst}")
+    else:
+        with open(dst, "w", encoding="utf-8") as f:
+            json.dump(
+                {"preprocess_version": "unknown",
+                 "warning": "未找到 nifti_norm/preprocess_meta.json（请先运行 step1 生成）"},
+                f, ensure_ascii=False, indent=2)
+        print(f"  WARNING: 未找到 {src}；已写入占位元数据 → {dst}")
 
 # ============================================================
 # 数据加载
@@ -289,7 +326,8 @@ def run_fold(fold_id, train_df, test_df, device, model_name, config):
 
     print(f"  Fold {fold_id}: train={len(train_set)}, val={len(val_set)}, test={len(test_set)}")
 
-    train_loader = DataLoader(train_set, BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
+    train_loader = DataLoader(train_set, BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS,
+                              generator=torch.Generator().manual_seed(42))
     val_loader = DataLoader(val_set, BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
     test_loader = DataLoader(test_set, BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
 
@@ -335,6 +373,9 @@ def run_fold(fold_id, train_df, test_df, device, model_name, config):
 
 
 def main():
+    # 固定随机源（须在任何模型创建与 DataLoader 构造之前）
+    seed_everything(42)
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="resnet50",
                         choices=list(MODEL_CONFIGS.keys()),
@@ -346,6 +387,7 @@ def main():
 
     ckpt_dir = os.path.join(PROJECT_ROOT, "checkpoints", model_name)
     os.makedirs(ckpt_dir, exist_ok=True)
+    write_preprocess_meta_sidecar(ckpt_dir)
     results_csv = os.path.join(PROJECT_ROOT, f"cv_results_{model_name}.csv")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

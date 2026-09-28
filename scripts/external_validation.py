@@ -13,21 +13,33 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import shutil
 import tempfile
 
 import numpy as np
 import nibabel as nib
-import pydicom
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-from scipy.ndimage import zoom
 from sklearn.metrics import (
     roc_auc_score, accuracy_score, precision_score, recall_score, f1_score, confusion_matrix,
 )
+
+try:
+    from scripts.preprocessing import (
+        read_dicom_series, build_dicom_affine, center_crop_160, min_max_norm,
+        resize_110x110x8, CROP_SIZE, TARGET_SIZE, PREPROCESS_VERSION,
+        DEFAULT_WINDOW_CENTER, DEFAULT_WINDOW_WIDTH,
+    )
+except ImportError:  # 直接以 python scripts/external_validation.py 运行时 sys.path[0]=scripts
+    from preprocessing import (
+        read_dicom_series, build_dicom_affine, center_crop_160, min_max_norm,
+        resize_110x110x8, CROP_SIZE, TARGET_SIZE, PREPROCESS_VERSION,
+        DEFAULT_WINDOW_CENTER, DEFAULT_WINDOW_WIDTH,
+    )
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXTERNAL_DICOM_DIR = os.path.join(PROJECT_ROOT, 'data', '外部验证未标注')
@@ -36,8 +48,6 @@ EXTERNAL_NIFTI_ROI = os.path.join(PROJECT_ROOT, 'external_roi')
 EXTERNAL_NIFTI_NORM = os.path.join(PROJECT_ROOT, 'external_nifti_v3')
 EXTERNAL_RESULTS = os.path.join(PROJECT_ROOT, 'external_results')
 
-CROP_SIZE = 160
-TARGET_SIZE = (110, 110, 8)
 BATCH_SIZE = 16
 N_FOLDS = 5
 
@@ -58,27 +68,19 @@ MODEL_CONFIGS = {
 # ============================================================
 # Step 1: DICOM → NIfTI (适配外部验证目录结构)
 # ============================================================
-def _read_dicom_series(dicom_dir):
-    """读取整个 DICOM 序列，按 InstanceNumber 排序，RGB→灰度"""
-    slices = []
-    for f in sorted(os.listdir(dicom_dir)):
-        if not f.endswith('.dcm'):
-            continue
-        d = pydicom.dcmread(os.path.join(dicom_dir, f), force=True)
-        pix = d.pixel_array.astype(np.float32)
-        if pix.ndim == 3 and pix.shape[2] == 3:
-            pix = 0.299 * pix[:,:,0] + 0.587 * pix[:,:,1] + 0.114 * pix[:,:,2]
-        slices.append((d.InstanceNumber, pix))
-    slices.sort(key=lambda x: x[0])
-    return np.stack([s[1] for s in slices], axis=2)
-
-
 def convert_external_dicom():
-    """将外部验证 DICOM → NIfTI（无 dicom/ 子目录）"""
+    """将外部验证 DICOM → NIfTI（无 dicom/ 子目录，带真实 affine）
+
+    预处理逻辑与 step1_preprocess.py 完全一致（共享 scripts/preprocessing.py）:
+    Rescale→HU + 窗宽窗位（默认 WC=40, WW=400）→ [0,1]。
+    返回 {label: {pid: meta}} 供 normalize 阶段写元数据 sidecar。
+    """
     print("=" * 60)
-    print("Step 1: 外部验证 DICOM → NIfTI")
+    print("Step 1: 外部验证 DICOM → NIfTI (Rescale + 窗宽窗位 WC="
+          f"{DEFAULT_WINDOW_CENTER}, WW={DEFAULT_WINDOW_WIDTH})")
     print("=" * 60)
 
+    patient_metas = {}
     for label in ['0', '1']:
         src = os.path.join(EXTERNAL_DICOM_DIR, label)
         if not os.path.exists(src):
@@ -86,24 +88,29 @@ def convert_external_dicom():
             continue
         dst = os.path.join(EXTERNAL_NIFTI_RAW, label)
         os.makedirs(dst, exist_ok=True)
+        patient_metas[label] = {}
 
         subs = sorted([d for d in os.listdir(src) if os.path.isdir(os.path.join(src, d))])
         success, fail = 0, 0
         for sub in subs:
             patient_dir = os.path.join(src, sub)
             try:
-                vol = _read_dicom_series(patient_dir)
+                vol, meta = read_dicom_series(patient_dir)
+                affine = build_dicom_affine(meta)
                 out_path = os.path.join(dst, f'{sub}.nii.gz')
-                nib.save(nib.Nifti1Image(vol, np.eye(4)), out_path)
+                nib.save(nib.Nifti1Image(vol, affine), out_path)
+                meta['label'] = label
+                patient_metas[label][sub] = meta
                 success += 1
             except Exception as e:
                 fail += 1
                 print(f"  [失败] {sub}: {e}")
         print(f"  label={label}: 成功 {success}, 失败 {fail}")
+    return patient_metas
 
 
 # ============================================================
-# Step 2: 中心裁剪 160×160
+# Step 2: 中心裁剪 160×160（affine 平移同步调整）
 # ============================================================
 def crop_external():
     print("\n" + "=" * 60)
@@ -120,18 +127,16 @@ def crop_external():
                 continue
             nii = nib.load(os.path.join(src, f))
             data = nii.get_fdata().astype(np.float32)
-            h, w = data.shape[0], data.shape[1]
-            cy, cx = h // 2, w // 2
-            half = CROP_SIZE // 2
-            cropped = data[cy - half:cy + half, cx - half:cx + half, :]
-            nib.save(nib.Nifti1Image(cropped, np.eye(4)), os.path.join(dst, f))
+            affine = np.array(nii.affine, dtype=np.float64)
+            cropped, _offsets, affine = center_crop_160(data, affine)
+            nib.save(nib.Nifti1Image(cropped, affine), os.path.join(dst, f))
     print(f"  完成")
 
 
 # ============================================================
 # Step 3: per-image min-max 归一化 → 110×110×8（与训练数据一致）
 # ============================================================
-def normalize_external():
+def normalize_external(patient_metas):
     print("\n" + "=" * 60)
     print("Step 3: min-max 归一化 → 110×110×8")
     print("=" * 60)
@@ -146,16 +151,29 @@ def normalize_external():
                 continue
             nii = nib.load(os.path.join(src, f))
             data = nii.get_fdata().astype(np.float32)
-            # per-image min-max 归一化到 [0, 1]（与训练数据一致）
-            dmin, dmax = data.min(), data.max()
-            if dmax > dmin:
-                data = (data - dmin) / (dmax - dmin)
-            zoom_factors = (TARGET_SIZE[0] / data.shape[0],
-                            TARGET_SIZE[1] / data.shape[1],
-                            TARGET_SIZE[2] / data.shape[2])
-            data = zoom(data, zoom_factors, order=1)
-            nib.save(nib.Nifti1Image(data, np.eye(4)), os.path.join(dst, f))
+            affine = np.array(nii.affine, dtype=np.float64)
+            data = min_max_norm(data)
+            data, affine = resize_110x110x8(data, affine)
+            nib.save(nib.Nifti1Image(data, affine), os.path.join(dst, f))
+            pid = f.replace('.nii.gz', '')
+            meta = patient_metas.get(label, {}).get(pid)
+            if meta is not None:
+                meta['affine'] = affine.tolist()
     print(f"  完成")
+
+    meta_path = os.path.join(EXTERNAL_NIFTI_NORM, 'preprocess_meta.json')
+    payload = {
+        "preprocess_version": PREPROCESS_VERSION,
+        "default_window_center": DEFAULT_WINDOW_CENTER,
+        "default_window_width": DEFAULT_WINDOW_WIDTH,
+        "crop_size": CROP_SIZE,
+        "target_size": list(TARGET_SIZE),
+        "pipeline": "read_dicom_series(Rescale+window[0,1]) -> center_crop_160 -> min_max_norm -> resize_110x110x8",
+        "patients": {label: pmetas for label, pmetas in patient_metas.items()},
+    }
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    print(f"  预处理元数据 → {meta_path}")
 
 
 # ============================================================
@@ -515,9 +533,9 @@ def main():
             if os.path.exists(d):
                 shutil.rmtree(d)
 
-        convert_external_dicom()
+        patient_metas = convert_external_dicom()
         crop_external()
-        normalize_external()
+        normalize_external(patient_metas)
     elif args.data_dir:
         print(f"使用已有预处理数据: {args.data_dir}")
     else:

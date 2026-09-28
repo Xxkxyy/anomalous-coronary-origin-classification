@@ -9,8 +9,7 @@
 步骤:
   Step 1: DICOM → NIfTI → 裁剪 → 归一化
   Step 2: 8:2 holdout + 5-fold CV 划分
-  Step 3: 5-fold CV 训练 (主模型)
-  Step 3b: 5-fold CV 训练 (基线模型，可选)
+  Step 3: 5-fold CV 训练 (主模型 / 基线对比模型)
   Step 4: SCI 期刊级评估与多模型对比
 """
 import sys, os, logging, time, argparse
@@ -69,25 +68,17 @@ def main():
     else:
         models = [args.model]
 
+    import subprocess
     for model_name in models:
         log.info(f"Training model: {model_name}")
-        import subprocess
-        cmd = f'"{sys.executable}" scripts/step3_train.py --model {model_name}'
         t0 = time.time()
         log.info(f"START: Step 3 - {model_name}")
-        subprocess.run(cmd, cwd=PROJECT_ROOT, check=True)
+        subprocess.run(
+            [sys.executable, "scripts/step3_train.py", "--model", model_name],
+            cwd=PROJECT_ROOT,
+            check=True,
+        )
         log.info(f"DONE: Step 3 - {model_name} ({time.time() - t0:.1f}s)")
-
-    # Step 3b: Radiomics baselines
-    if args.baselines:
-        import subprocess
-        for cls_name in ["svm", "rf"]:
-            log.info(f"Training: radiomics + {cls_name}")
-            cmd = f'"{sys.executable}" scripts/baseline_radiomics.py --classifier {cls_name}'
-            t0 = time.time()
-            log.info(f"START: Step 3b - radiomics_{cls_name}")
-            subprocess.run(cmd, cwd=PROJECT_ROOT, check=True)
-            log.info(f"DONE: Step 3b - radiomics_{cls_name} ({time.time() - t0:.1f}s)")
 
     # Step 4: 评估
     from step4_evaluate import main as step4
